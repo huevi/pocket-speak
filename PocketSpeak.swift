@@ -39,11 +39,30 @@ enum SpeechError: LocalizedError {
     private var hotkey: EventHotKeyRef?
     private var handler: EventHandlerRef?
     private var server: Process?
+    private var serverVoice: String?
     private var port = 0
     private var reading: Task<Void, Never>?
     private var activeRead: UUID?
     private var loginItem: NSMenuItem?
     private var captureInProgress = false
+
+    private enum SetupStep {
+        case download, downloading(Int64), downloadFailed(String), starting, engineFailed(String)
+        case preview, permission, shortcut(String?), complete
+    }
+
+    private var assets = ModelAssets()
+    private var setupWindow: SetupWindow?
+    private var setupStep: SetupStep = .download {
+        didSet { updateSetupWindow() }
+    }
+    private var setupTask: Task<Void, Never>?
+    private var permissionTask: Task<Void, Never>?
+    private var engineReady = false
+    private var previewPlayed = false
+    private var setupFinished: Bool {
+        UserDefaults.standard.bool(forKey: "finishedSetup")
+    }
 
     private var voice: String {
         let saved = UserDefaults.standard.string(forKey: "voice") ?? "alba"
@@ -61,28 +80,25 @@ enum SpeechError: LocalizedError {
         audio.connect(player, to: timePitch, format: format)
         audio.connect(timePitch, to: audio.mainMixerNode, format: format)
         setupMenu()
-        do {
-            try registerShortcut()
-            try startServer()
-            Task {
-                do {
-                    try await waitForServer()
-                    if reading == nil { showReady() }
-                } catch {
-                    if reading == nil { show(error) }
-                }
-            }
-        } catch {
-            show(error)
+        #if SETUP_SMOKE_TEST
+        if let command = CommandLine.arguments.dropFirst().first {
+            runSetupSmoke(command)
+            return
         }
-        if !AXIsProcessTrusted() {
-            AXIsProcessTrustedWithOptions(
-                [kAXTrustedCheckOptionPrompt.takeUnretainedValue(): true] as CFDictionary
-            )
+        #endif
+        if assets.isInstalled {
+            if setupFinished && AXIsProcessTrusted() { enableShortcut() }
+            else { openSetup() }
+            prepareEngine()
+        } else {
+            detail.title = "Set up the voice to begin"
+            openSetup()
         }
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        setupTask?.cancel()
+        permissionTask?.cancel()
         stop()
         if let server, server.isRunning { server.terminate() }
         if let hotkey { UnregisterEventHotKey(hotkey) }
@@ -111,6 +127,7 @@ enum SpeechError: LocalizedError {
         updateChoices()
         menu.addItem(.separator())
         add("Stop Speaking", #selector(stop), to: menu)
+        add("Setup…", #selector(openSetup), to: menu)
         add("Accessibility Settings…", #selector(openAccessibility), to: menu)
         loginItem = add("Open at Login", #selector(toggleLogin), to: menu)
         updateLoginMenu()
@@ -156,7 +173,136 @@ enum SpeechError: LocalizedError {
         detail.title = "Pocket TTS · \(voice.capitalized) · \(speedLabel) · Ready"
     }
 
+    @objc private func openSetup() {
+        if setupWindow == nil { setupWindow = SetupWindow() }
+        updateSetupWindow()
+        setupWindow?.focus()
+    }
+
+    private func updateSetupWindow() {
+        guard let window = setupWindow else { return }
+        let downloadSize = ByteCountFormatter.string(fromByteCount: ModelAssets.totalSize, countStyle: .file)
+        switch setupStep {
+        case .download:
+            window.update("Download English voices",
+                          "The full Pocket TTS model and five voice presets need a one-time \(downloadSize) download. After setup, speech runs offline on this Mac.",
+                          action: ("Download", { [weak self] in _ = self?.downloadAssets() }))
+        case let .downloading(bytes):
+            let fraction = Double(bytes) / Double(ModelAssets.totalSize)
+            let size = ByteCountFormatter.string(fromByteCount: bytes, countStyle: .file)
+            window.update("Downloading English voices", "\(size) of \(downloadSize). You can leave this window open or come back later.",
+                          fraction: fraction, alternate: ("Cancel", { [weak self] in _ = self?.setupTask?.cancel() }))
+        case let .downloadFailed(message):
+            window.update("Download paused", message,
+                          action: ("Retry", { [weak self] in _ = self?.downloadAssets() }))
+        case .starting:
+            window.update("Loading Pocket TTS", "Pocket Speak is loading the voices on this Mac.")
+        case let .engineFailed(message):
+            window.update("Couldn’t load Pocket TTS", message,
+                          action: ("Retry", { [weak self] in _ = self?.prepareEngine() }),
+                          alternate: ("Verify Downloads", { [weak self] in _ = self?.downloadAssets() }))
+        case .preview:
+            window.update("Hear a sample", "Play a short sentence with Alba to check your audio output.",
+                          action: ("Play Sample", { [weak self] in _ = self?.playSetupSample() }),
+                          alternate: previewPlayed ? ("Continue", { [weak self] in _ = self?.enableShortcut() }) : nil)
+        case .permission:
+            window.update("Allow selected-text access",
+                          "macOS Accessibility lets Pocket Speak read highlighted text from other apps. Enable Pocket Speak in Privacy & Security → Accessibility.",
+                          action: ("Open Accessibility Settings", { [weak self] in _ = self?.openAccessibility() }))
+        case let .shortcut(error):
+            let text = error ?? "Highlight the sample below and press Option–Escape. If Apple’s voice speaks, disable or reassign Speak Selection in Accessibility → Read & Speak."
+            window.update("Try Option–Escape", text, showSample: error == nil,
+                          action: error == nil ? nil : ("Retry Shortcut", { [weak self] in _ = self?.enableShortcut() }),
+                          alternate: ("Open Read & Speak", {
+                              _ = NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.Accessibility-Settings.extension?SpokenContent")!)
+                          }))
+        case .complete:
+            window.update("Pocket Speak is ready", "Highlight text in an app and press Option–Escape to read it aloud. Press it again to stop.",
+                          action: ("Done", { [weak self] in _ = self?.setupWindow?.close() }))
+        }
+    }
+
+    private func downloadAssets() {
+        guard setupTask == nil else { return }
+        setupStep = .downloading(0)
+        detail.title = "Downloading English voices…"
+        setupTask = Task {
+            do {
+                try await assets.install { [weak self] bytes in
+                    Task { @MainActor in
+                        guard let self, case let .downloading(previous) = self.setupStep, bytes > previous else { return }
+                        self.setupStep = .downloading(bytes)
+                    }
+                }
+                try Task.checkCancellation()
+                setupTask = nil
+                prepareEngine()
+            } catch {
+                setupTask = nil
+                setupStep = .downloadFailed(Task.isCancelled
+                    ? "The download was canceled. Retry to reuse any completed files."
+                    : error.localizedDescription)
+                detail.title = "Voice setup needs attention"
+            }
+        }
+    }
+
+    private func prepareEngine() {
+        guard setupTask == nil else { return }
+        setupStep = .starting
+        detail.title = "Loading Pocket TTS…"
+        setupTask = Task {
+            defer { setupTask = nil }
+            do {
+                try startServer(voice: voice)
+                try await waitForServer()
+                engineReady = true
+                showReady()
+                if setupFinished { enableShortcut() }
+                else { setupStep = .preview }
+            } catch is CancellationError {
+                return
+            } catch {
+                if let server, server.isRunning { server.terminate() }
+                engineReady = false
+                setupStep = .engineFailed(error.localizedDescription)
+                detail.title = "Voice setup needs attention"
+                openSetup()
+            }
+        }
+    }
+
+    private func enableShortcut() {
+        guard AXIsProcessTrusted() else {
+            setupStep = .permission
+            if permissionTask == nil {
+                permissionTask = Task {
+                    while !AXIsProcessTrusted() {
+                        try? await Task.sleep(for: .milliseconds(500))
+                        if Task.isCancelled { return }
+                    }
+                    permissionTask = nil
+                    enableShortcut()
+                }
+            }
+            return
+        }
+        do {
+            try registerShortcut()
+            setupStep = setupFinished ? .complete : .shortcut(nil)
+        } catch {
+            setupStep = .shortcut(error.localizedDescription)
+            openSetup()
+        }
+    }
+
+    private func playSetupSample() {
+        guard engineReady, reading == nil, let sample = setupWindow?.sampleText else { return }
+        startReading(sample: sample)
+    }
+
     private func registerShortcut() throws {
+        if hotkey != nil { return }
         var spec = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))
         let context = Unmanaged.passUnretained(self).toOpaque()
         let install = InstallEventHandler(GetApplicationEventTarget(), { _, _, context in
@@ -170,24 +316,35 @@ enum SpeechError: LocalizedError {
         let register = RegisterEventHotKey(
             UInt32(kVK_Escape), UInt32(optionKey), id, GetApplicationEventTarget(), 0, &hotkey
         )
-        guard register == noErr else { throw SpeechError.hotkey(register) }
+        guard register == noErr else {
+            if let handler { RemoveEventHandler(handler) }
+            handler = nil
+            throw SpeechError.hotkey(register)
+        }
         log("Option–Escape registered")
     }
 
-    private func startServer() throws {
-        if server?.isRunning == true { return }
-        guard let executable = Bundle.main.url(forAuxiliaryExecutable: "pocket-tts") else {
+    private func startServer(voice: String) throws {
+        if let server, server.isRunning {
+            if serverVoice == voice { return }
+            server.terminate()
+        }
+        guard assets.isInstalled,
+              let executable = Bundle.main.url(forAuxiliaryExecutable: "pocket-tts"),
+              let config = Bundle.main.url(forResource: "english", withExtension: "yaml") else {
             throw SpeechError.engine
         }
         port = Int.random(in: 49_152...65_535)
         let process = Process()
         process.executableURL = executable
+        process.currentDirectoryURL = assets.directory
         process.arguments = ["serve", "--host", "127.0.0.1", "--port", String(port),
-                             "--language", "english", "--default-voice", "alba"]
+                             "--config", config.path, "--default-voice", assets.location("\(voice).safetensors").path]
         process.standardOutput = FileHandle.nullDevice
         process.standardError = FileHandle.nullDevice
         try process.run()
         server = process
+        serverVoice = voice
     }
 
     private func endpoint(_ path: String) -> URL {
@@ -212,10 +369,18 @@ enum SpeechError: LocalizedError {
             stop()
             return
         }
+        guard engineReady else {
+            openSetup()
+            return
+        }
         guard !captureInProgress else { return }
+        startReading()
+    }
+
+    private func startReading(sample: String? = nil) {
         let start = ContinuousClock.now
-        let selectedVoice = voice
-        let selectedSpeed = speed
+        let selectedVoice = sample == nil ? voice : "alba"
+        let selectedSpeed: Float = sample == nil ? speed : 1
         let id = UUID()
         activeRead = id
         reading = Task {
@@ -226,14 +391,25 @@ enum SpeechError: LocalizedError {
                 }
             }
             do {
-                let text = try await selection()
+                let text: String
+                if let sample { text = sample }
+                else { text = try await selection() }
                 try Task.checkCancellation()
                 log("Captured \(text.utf8.count) bytes in \(start.duration(to: .now))")
                 detail.title = "Starting speech…"
-                try startServer()
+                try startServer(voice: selectedVoice)
                 try await waitForServer()
                 try await speak(text, voice: selectedVoice, speed: selectedSpeed, started: start, id: id)
-                if activeRead == id { showReady() }
+                if activeRead == id {
+                    showReady()
+                    if sample != nil {
+                        previewPlayed = true
+                        updateSetupWindow()
+                    } else if !setupFinished {
+                        UserDefaults.standard.set(true, forKey: "finishedSetup")
+                        setupStep = .complete
+                    }
+                }
             } catch is CancellationError {
                 return
             } catch {
@@ -241,6 +417,10 @@ enum SpeechError: LocalizedError {
                     player.stop()
                     audio.stop()
                     show(error)
+                    if sample != nil {
+                        setupWindow?.update("Couldn’t play the sample", error.localizedDescription,
+                                            action: ("Retry", { [weak self] in _ = self?.playSetupSample() }))
+                    }
                 }
             }
         }
@@ -248,6 +428,7 @@ enum SpeechError: LocalizedError {
 
     private func selection() async throws -> String {
         guard AXIsProcessTrusted() else { throw SpeechError.permission }
+        if let sample = setupWindow?.selectedSample { return sample }
         let system = AXUIElementCreateSystemWide()
         var focusedValue: CFTypeRef?
         if AXUIElementCopyAttributeValue(system, kAXFocusedUIElementAttribute as CFString, &focusedValue) == .success,
@@ -306,7 +487,7 @@ enum SpeechError: LocalizedError {
         if sentences.isEmpty { sentences = [text] }
 
         // Queue complete sentences so generation or network jitter cannot cut into a word.
-        var sentence = try await synthesize(sentences[0], voice: voice)
+        var sentence = try await synthesize(sentences[0])
         try Task.checkCancellation()
         audio.reset()
         timePitch.rate = speed
@@ -331,7 +512,7 @@ enum SpeechError: LocalizedError {
                 detail.title = "Speaking · ⌥ Esc to stop"
                 log("Playback queued after \(started.duration(to: .now)) with \(voice.capitalized) at \(speed)× (\(sentence.frameLength) frames)")
             }
-            if !isLast { sentence = try await synthesize(sentences[index + 1], voice: voice) }
+            if !isLast { sentence = try await synthesize(sentences[index + 1]) }
         }
         while !finished {
             try await Task.sleep(for: .milliseconds(30))
@@ -343,11 +524,9 @@ enum SpeechError: LocalizedError {
         }
     }
 
-    private func synthesize(_ text: String, voice: String) async throws -> AVAudioPCMBuffer {
+    private func synthesize(_ text: String) async throws -> AVAudioPCMBuffer {
         var form = URLComponents()
-        var fields = [URLQueryItem(name: "text", value: text)]
-        if voice != "alba" { fields.append(URLQueryItem(name: "voice_url", value: voice)) }
-        form.queryItems = fields
+        form.queryItems = [URLQueryItem(name: "text", value: text)]
         var request = URLRequest(url: endpoint("tts"))
         request.httpMethod = "POST"
         request.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
@@ -394,6 +573,10 @@ enum SpeechError: LocalizedError {
     }
 
     @objc private func openAccessibility() {
+        if !AXIsProcessTrusted() {
+            let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue(): true] as CFDictionary
+            AXIsProcessTrustedWithOptions(options)
+        }
         NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")!)
     }
 
@@ -420,6 +603,40 @@ enum SpeechError: LocalizedError {
         log("Error: \(error.localizedDescription)")
         NSSound.beep()
     }
+
+    #if SETUP_SMOKE_TEST
+    private func runSetupSmoke(_ command: String) {
+        Task {
+            do {
+                assets = try smokeAssets()
+                if command == "download" { try await checkDownload(assets) }
+                try checkInstalled(assets)
+                for name in voices {
+                    try startServer(voice: name)
+                    try await waitForServer()
+                    let frames = try await synthesize("Pocket Speak runs locally.").frameLength
+                    guard frames > 4_800 else { throw SpeechError.audio }
+                    print("Verified \(name): \(frames) frames")
+                }
+                if command == "offline" {
+                    setupWindow = SetupWindow()
+                    setupStep = .preview
+                    engineReady = true
+                    playSetupSample()
+                    await reading?.value
+                    guard previewPlayed else { throw SpeechError.audio }
+                    print("Played the onboarding sample through the app’s audio pipeline.")
+                }
+                if let server, server.isRunning { server.terminate() }
+                exit(EXIT_SUCCESS)
+            } catch {
+                if let server, server.isRunning { server.terminate() }
+                FileHandle.standardError.write(Data("Setup check failed: \(error)\n".utf8))
+                exit(EXIT_FAILURE)
+            }
+        }
+    }
+    #endif
 
     private func log(_ message: String) {
         let url = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Logs/Pocket Speak.log")
