@@ -19,9 +19,83 @@ enum SpeechError: LocalizedError {
     }
 }
 
-@MainActor final class PocketSpeak: NSObject, NSApplicationDelegate {
+private final class SpeechMenuHeader: NSView {
+    private let detail = NSTextField(labelWithString: "")
+
+    init(name: String, symbol: String) {
+        super.init(frame: NSRect(x: 0, y: 0, width: 280, height: 58))
+        let icon = NSImageView(frame: NSRect(x: 17, y: 19, width: 22, height: 22))
+        icon.image = NSImage(systemSymbolName: symbol, accessibilityDescription: nil)
+        icon.contentTintColor = .secondaryLabelColor
+        let title = NSTextField(labelWithString: name)
+        title.frame = NSRect(x: 48, y: 32, width: 216, height: 18)
+        title.font = .systemFont(ofSize: 14, weight: .semibold)
+        detail.frame = NSRect(x: 48, y: 12, width: 216, height: 17)
+        detail.font = .systemFont(ofSize: 11, weight: .medium)
+        detail.textColor = .secondaryLabelColor
+        detail.lineBreakMode = .byTruncatingTail
+        for view in [icon, title, detail] { addSubview(view) }
+        setAccessibilityRole(.group)
+        setAccessibilityLabel(name)
+    }
+
+    required init?(coder: NSCoder) { nil }
+
+    func setStatus(_ text: String) {
+        detail.stringValue = text
+        detail.toolTip = text
+        setAccessibilityValue(text)
+    }
+}
+
+private final class ShortcutMenuRow: NSView {
+    private let label: NSTextField
+    private let keys: NSTextField
+    private let keyLabel: String
+
+    init(_ title: String, keys: String) {
+        label = NSTextField(labelWithString: title)
+        self.keys = NSTextField(labelWithString: keys)
+        keyLabel = keys
+        super.init(frame: NSRect(x: 0, y: 0, width: 280, height: 23))
+        label.frame = NSRect(x: 19, y: 4, width: 151, height: 16)
+        label.font = .menuFont(ofSize: 0)
+        self.keys.frame = NSRect(x: 168, y: 4, width: 96, height: 16)
+        self.keys.font = .systemFont(ofSize: 12, weight: .medium)
+        self.keys.textColor = .secondaryLabelColor
+        self.keys.alignment = .right
+        addSubview(label)
+        addSubview(self.keys)
+        setAccessibilityRole(.group)
+        setAvailable(true)
+    }
+
+    required init?(coder: NSCoder) { nil }
+
+    func setAvailable(_ available: Bool) {
+        label.textColor = available ? .labelColor : .secondaryLabelColor
+        keys.stringValue = available ? keyLabel : "Unavailable"
+        setAccessibilityLabel("\(label.stringValue), \(keyLabel)")
+        setAccessibilityValue(available ? nil : "Unavailable")
+        toolTip = available ? nil : "\(keyLabel) is unavailable. See Setup."
+    }
+
+    func menuItem() -> NSMenuItem {
+        let item = NSMenuItem()
+        item.view = self
+        return item
+    }
+}
+
+@MainActor final class PocketSpeak: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenuItemValidation {
     private let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-    private let detail = NSMenuItem(title: "Starting Pocket TTS…", action: nil, keyEquivalent: "")
+    private let menuHeader = SpeechMenuHeader(name: "Pocket Speak", symbol: "text.bubble")
+    private let shortcutRow = ShortcutMenuRow("Read Selection / Stop", keys: "⌥Esc")
+    private var stopItem: NSMenuItem!
+    private var voiceItem: NSMenuItem!
+    private var speedItem: NSMenuItem!
+    private var setupItem: NSMenuItem!
+    private var loginItem: NSMenuItem!
     private let audio = AVAudioEngine()
     private let player = AVAudioPlayerNode()
     private let timePitch = AVAudioUnitTimePitch()
@@ -42,10 +116,11 @@ enum SpeechError: LocalizedError {
     private var serverVoice: String?
     private var port = 0
     private var reading: Task<Void, Never>? {
-        didSet { updateStatusIcon() }
+        didSet { refreshStatus() }
     }
     private var activeRead: UUID?
-    private var loginItem: NSMenuItem?
+    private var playbackStatus = "Preparing speech…"
+    private var playbackIssue: (message: String, until: ContinuousClock.Instant)?
     private var captureInProgress = false
 
     private enum SetupStep {
@@ -56,7 +131,10 @@ enum SpeechError: LocalizedError {
     private var assets = ModelAssets()
     private var setupWindow: SetupWindow?
     private var setupStep: SetupStep = .download {
-        didSet { updateSetupWindow() }
+        didSet {
+            updateSetupWindow()
+            refreshStatus()
+        }
     }
     private var setupTask: Task<Void, Never>?
     private var permissionTask: Task<Void, Never>?
@@ -93,7 +171,6 @@ enum SpeechError: LocalizedError {
             else { openSetup() }
             prepareEngine()
         } else {
-            detail.title = "Set up the voice to begin"
             openSetup()
         }
     }
@@ -108,18 +185,22 @@ enum SpeechError: LocalizedError {
     }
 
     private func setupMenu() {
-        updateStatusIcon()
         let menu = NSMenu()
-        menu.addItem(detail)
+        let header = NSMenuItem()
+        header.view = menuHeader
+        menu.addItem(header)
         menu.addItem(.separator())
-        let voiceItem = NSMenuItem(title: "Voice", action: nil, keyEquivalent: "")
+        menu.addItem(shortcutRow.menuItem())
+        stopItem = add("Stop Speaking", #selector(stop), to: menu)
+        menu.addItem(.separator())
+        voiceItem = NSMenuItem(title: "Voice", action: nil, keyEquivalent: "")
         voiceItem.submenu = voiceMenu
         for name in voices {
             add(name.capitalized, #selector(setVoice(_:)), to: voiceMenu).representedObject = name
         }
         menu.addItem(voiceItem)
 
-        let speedItem = NSMenuItem(title: "Speed", action: nil, keyEquivalent: "")
+        speedItem = NSMenuItem(title: "Speed", action: nil, keyEquivalent: "")
         speedItem.submenu = speedMenu
         for (label, rate) in speeds {
             add(label, #selector(setSpeed(_:)), to: speedMenu).representedObject = NSNumber(value: rate)
@@ -127,28 +208,84 @@ enum SpeechError: LocalizedError {
         menu.addItem(speedItem)
         updateChoices()
         menu.addItem(.separator())
-        add("Stop Speaking", #selector(stop), to: menu)
-        add("Setup…", #selector(openSetup), to: menu)
-        add("Accessibility Settings…", #selector(openAccessibility), to: menu)
+        setupItem = add("Setup…", #selector(openSetup), to: menu)
         loginItem = add("Open at Login", #selector(toggleLogin), to: menu)
-        updateLoginMenu()
         menu.addItem(.separator())
-        add("Quit Pocket Speak", #selector(quit), to: menu)
+        add("Quit Pocket Speak", #selector(quit), to: menu).keyEquivalent = "q"
+        menu.delegate = self
         statusItem.menu = menu
+        refreshMenu()
     }
 
-    private func updateStatusIcon() {
+    func menuNeedsUpdate(_ menu: NSMenu) { refreshMenu() }
+
+    func validateMenuItem(_ item: NSMenuItem) -> Bool {
+        item !== stopItem || reading != nil
+    }
+
+    private var needsAccessibility: Bool {
+        switch setupStep {
+        case .permission, .shortcut, .complete:
+            return !AXIsProcessTrusted()
+        default:
+            return false
+        }
+    }
+
+    private func refreshMenu() {
+        refreshStatus()
+        shortcutRow.setAvailable(engineReady && hotkey != nil && !needsAccessibility)
+        stopItem.isHidden = reading == nil
+        if needsAccessibility {
+            setupItem.title = "Set Up Accessibility…"
+        } else {
+            switch setupStep {
+            case .download: setupItem.title = "Set Up Voice…"
+            case .preview: setupItem.title = previewPlayed ? "Continue Setup…" : "Set Up Voice…"
+            case .downloading, .starting: setupItem.title = "View Voice Setup…"
+            case .downloadFailed, .engineFailed: setupItem.title = "Retry Voice Setup…"
+            case .permission, .shortcut: setupItem.title = "Set Up Shortcut…"
+            case .complete: setupItem.title = "Setup…"
+            }
+        }
+        updateLoginMenu()
+    }
+
+    private func refreshStatus() {
+        let message: String
+        if reading != nil {
+            message = playbackStatus
+        } else if needsAccessibility {
+            message = "Accessibility access required"
+        } else if let issue = playbackIssue, issue.until > .now {
+            message = issue.message
+        } else {
+            switch setupStep {
+            case .download: message = "Voice download required"
+            case .downloading: message = "Downloading English voices…"
+            case .downloadFailed: message = "Voice download failed"
+            case .starting: message = "Loading voices…"
+            case .engineFailed: message = "Couldn’t load voices"
+            case .preview: message = previewPlayed ? "Finish setting up the shortcut" : "Try a voice sample"
+            case .permission: message = "Setting up the shortcut…"
+            case .shortcut(nil): message = "Try the shortcut"
+            case .shortcut(.some): message = "Shortcut unavailable"
+            case .complete: message = "Ready"
+            }
+        }
         guard let button = statusItem.button else { return }
-        let isReading = reading != nil
-        let description = isReading ? "Pocket Speak, reading" : "Pocket Speak"
-        let symbol = isReading ? "text.bubble.fill" : "text.bubble"
-        let configuration = NSImage.SymbolConfiguration(pointSize: 15, weight: .medium)
-        let image = NSImage(systemSymbolName: symbol, accessibilityDescription: description)?
-            .withSymbolConfiguration(configuration)
-        image?.isTemplate = true
-        button.image = image
-        button.toolTip = isReading ? "Pocket Speak · Option–Escape to stop" : "Pocket Speak"
-        button.setAccessibilityLabel(description)
+        menuHeader.setStatus(message)
+        let description = "Pocket Speak, \(message)"
+        if button.toolTip != description {
+            let symbol = reading != nil ? "text.bubble.fill" : "text.bubble"
+            let configuration = NSImage.SymbolConfiguration(pointSize: 15, weight: .medium)
+            let image = NSImage(systemSymbolName: symbol, accessibilityDescription: nil)?
+                .withSymbolConfiguration(configuration)
+            image?.isTemplate = true
+            button.image = image
+            button.toolTip = description
+            button.setAccessibilityLabel(description)
+        }
     }
 
     @discardableResult
@@ -163,7 +300,6 @@ enum SpeechError: LocalizedError {
         guard let name = item.representedObject as? String, voices.contains(name) else { return }
         UserDefaults.standard.set(name, forKey: "voice")
         updateChoices()
-        if reading == nil { showReady() }
     }
 
     @objc private func setSpeed(_ item: NSMenuItem) {
@@ -171,10 +307,12 @@ enum SpeechError: LocalizedError {
               speeds.contains(where: { $0.1 == rate }) else { return }
         UserDefaults.standard.set(rate, forKey: "speed")
         updateChoices()
-        if reading == nil { showReady() }
     }
 
     private func updateChoices() {
+        voiceItem.title = "Voice · \(voice.capitalized)"
+        let speedLabel = speeds.first { $0.1 == speed }?.0 ?? "1×"
+        speedItem.title = "Speed · \(speedLabel)"
         for item in voiceMenu.items {
             item.state = (item.representedObject as? String) == voice ? .on : .off
         }
@@ -183,13 +321,9 @@ enum SpeechError: LocalizedError {
         }
     }
 
-    private func showReady() {
-        let speedLabel = speeds.first { $0.1 == speed }?.0 ?? "1×"
-        detail.title = "Pocket TTS · \(voice.capitalized) · \(speedLabel) · Ready"
-    }
-
     @objc private func openSetup() {
         if setupWindow == nil { setupWindow = SetupWindow() }
+        if needsAccessibility { enableShortcut() }
         updateSetupWindow()
         setupWindow?.focus()
     }
@@ -240,7 +374,6 @@ enum SpeechError: LocalizedError {
     private func downloadAssets() {
         guard setupTask == nil else { return }
         setupStep = .downloading(0)
-        detail.title = "Downloading English voices…"
         setupTask = Task {
             do {
                 try await assets.install { [weak self] bytes in
@@ -257,7 +390,6 @@ enum SpeechError: LocalizedError {
                 setupStep = .downloadFailed(Task.isCancelled
                     ? "The download was canceled. Retry to reuse any completed files."
                     : error.localizedDescription)
-                detail.title = "Voice setup needs attention"
             }
         }
     }
@@ -265,14 +397,12 @@ enum SpeechError: LocalizedError {
     private func prepareEngine() {
         guard setupTask == nil else { return }
         setupStep = .starting
-        detail.title = "Loading Pocket TTS…"
         setupTask = Task {
             defer { setupTask = nil }
             do {
                 try startServer(voice: voice)
                 try await waitForServer()
                 engineReady = true
-                showReady()
                 if setupFinished { enableShortcut() }
                 else { setupStep = .preview }
             } catch is CancellationError {
@@ -281,7 +411,6 @@ enum SpeechError: LocalizedError {
                 if let server, server.isRunning { server.terminate() }
                 engineReady = false
                 setupStep = .engineFailed(error.localizedDescription)
-                detail.title = "Voice setup needs attention"
                 openSetup()
             }
         }
@@ -384,7 +513,7 @@ enum SpeechError: LocalizedError {
             stop()
             return
         }
-        guard engineReady else {
+        guard engineReady, AXIsProcessTrusted() else {
             openSetup()
             return
         }
@@ -398,6 +527,8 @@ enum SpeechError: LocalizedError {
         let selectedSpeed: Float = sample == nil ? speed : 1
         let id = UUID()
         activeRead = id
+        playbackIssue = nil
+        playbackStatus = "Preparing speech…"
         reading = Task {
             defer {
                 if activeRead == id {
@@ -411,12 +542,10 @@ enum SpeechError: LocalizedError {
                 else { text = try await selection() }
                 try Task.checkCancellation()
                 log("Captured \(text.utf8.count) bytes in \(start.duration(to: .now))")
-                detail.title = "Starting speech…"
                 try startServer(voice: selectedVoice)
                 try await waitForServer()
                 try await speak(text, voice: selectedVoice, speed: selectedSpeed, started: start, id: id)
                 if activeRead == id {
-                    showReady()
                     if sample != nil {
                         previewPlayed = true
                         updateSetupWindow()
@@ -524,7 +653,8 @@ enum SpeechError: LocalizedError {
             }
             if index == 0 {
                 player.play()
-                detail.title = "Speaking · ⌥ Esc to stop"
+                playbackStatus = "Speaking…"
+                refreshStatus()
                 log("Playback queued after \(started.duration(to: .now)) with \(voice.capitalized) at \(speed)× (\(sentence.frameLength) frames)")
             }
             if !isLast { sentence = try await synthesize(sentences[index + 1]) }
@@ -579,12 +709,12 @@ enum SpeechError: LocalizedError {
     }
 
     @objc private func stop() {
+        guard let reading else { return }
         activeRead = nil
-        reading?.cancel()
-        reading = nil
+        reading.cancel()
+        self.reading = nil
         player.stop()
         if audio.isRunning { audio.stop() }
-        showReady()
     }
 
     @objc private func openAccessibility() {
@@ -596,25 +726,48 @@ enum SpeechError: LocalizedError {
     }
 
     @objc private func toggleLogin() {
+        let service = SMAppService.mainApp
         do {
-            let service = SMAppService.mainApp
-            if service.status == .enabled || service.status == .requiresApproval {
-                try service.unregister()
-            } else {
+            switch service.status {
+            case .enabled: try service.unregister()
+            case .requiresApproval: SMAppService.openSystemSettingsLoginItems()
+            default:
                 try service.register()
+                if service.status == .requiresApproval {
+                    SMAppService.openSystemSettingsLoginItems()
+                }
             }
             updateLoginMenu()
-        } catch { show(error) }
+        } catch {
+            let alert = NSAlert(error: error)
+            alert.messageText = "Couldn’t change Open at Login"
+            NSApp.activate(ignoringOtherApps: true)
+            alert.runModal()
+        }
     }
 
     private func updateLoginMenu() {
-        loginItem?.state = SMAppService.mainApp.status == .enabled ? .on : .off
+        switch SMAppService.mainApp.status {
+        case .enabled:
+            loginItem.state = .on
+            loginItem.toolTip = nil
+        case .requiresApproval:
+            loginItem.state = .mixed
+            loginItem.toolTip = "Approve in Login Items & Extensions."
+        default:
+            loginItem.state = .off
+            loginItem.toolTip = nil
+        }
     }
 
     @objc private func quit() { NSApp.terminate(nil) }
 
     private func show(_ error: Error) {
-        detail.title = error.localizedDescription
+        playbackIssue = (error.localizedDescription, .now + .seconds(8))
+        Task { [weak self] in
+            try? await Task.sleep(for: .seconds(8))
+            self?.refreshStatus()
+        }
         log("Error: \(error.localizedDescription)")
         NSSound.beep()
     }
