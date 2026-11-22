@@ -41,7 +41,9 @@ enum SpeechError: LocalizedError {
     private var server: Process?
     private var serverVoice: String?
     private var port = 0
-    private var reading: Task<Void, Never>?
+    private var reading: Task<Void, Never>? {
+        didSet { updateStatusIcon() }
+    }
     private var activeRead: UUID?
     private var loginItem: NSMenuItem?
     private var captureInProgress = false
@@ -106,8 +108,7 @@ enum SpeechError: LocalizedError {
     }
 
     private func setupMenu() {
-        statusItem.button?.title = "Pocket"
-        statusItem.button?.toolTip = "Pocket Speak"
+        updateStatusIcon()
         let menu = NSMenu()
         menu.addItem(detail)
         menu.addItem(.separator())
@@ -134,6 +135,20 @@ enum SpeechError: LocalizedError {
         menu.addItem(.separator())
         add("Quit Pocket Speak", #selector(quit), to: menu)
         statusItem.menu = menu
+    }
+
+    private func updateStatusIcon() {
+        guard let button = statusItem.button else { return }
+        let isReading = reading != nil
+        let description = isReading ? "Pocket Speak, reading" : "Pocket Speak"
+        let symbol = isReading ? "text.bubble.fill" : "text.bubble"
+        let configuration = NSImage.SymbolConfiguration(pointSize: 15, weight: .medium)
+        let image = NSImage(systemSymbolName: symbol, accessibilityDescription: description)?
+            .withSymbolConfiguration(configuration)
+        image?.isTemplate = true
+        button.image = image
+        button.toolTip = isReading ? "Pocket Speak · Option–Escape to stop" : "Pocket Speak"
+        button.setAccessibilityLabel(description)
     }
 
     @discardableResult

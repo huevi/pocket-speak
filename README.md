@@ -24,7 +24,7 @@ For regular use, move the app to your Applications folder before opening it and 
 3. Open **Accessibility Settings** from the app and turn on Pocket Speak. Permission lets the app read highlighted text and, if needed, copy it briefly. The app detects the grant and advances to the shortcut test.
 4. Highlight the sample and press **⌥ Esc**. If macOS reads it with an Apple voice, turn off or reassign **Speak Selection** in **System Settings → Accessibility → Read & Speak**. Press **⌥ Esc** again during reading to stop.
 
-Open **Pocket → Setup…** to revisit setup, **Pocket → Voice** to change the voice, or **Pocket → Speed** to choose a pitch-preserving rate for the next reading. The first read after changing voices may take a little longer because the app reloads the engine for the new voice. The app generates one sentence at a time to avoid feeding audio to the player mid-word.
+Click the **speech bubble** in the menu bar to open **Setup…**, change the **Voice**, or choose a pitch-preserving **Speed** for the next reading. The bubble fills in while Pocket Speak reads. The first read after changing voices may take a little longer because the app reloads the engine for the new voice. The app generates one sentence at a time to avoid feeding audio to the player mid-word.
 
 Model files are stored in `~/Library/Application Support/Pocket Speak/English Model v4`. The engine uses those verified local files to generate speech. Selected text is sent only to the bundled engine over localhost. The setup download contacts Hugging Face and the build fetches the engine from GitHub.
 
